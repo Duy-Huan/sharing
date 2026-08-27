@@ -1,0 +1,128 @@
+# IVSHMEM Bare-metal — RISC-V (QEMU `virt` machine)
+
+Firmware bare-metal RISC-V (rv64) minh hoạ giao tiếp giữa 2 tiến trình QEMU
+độc lập thông qua thiết bị PCI `ivshmem-plain`, dùng cơ chế cờ hiệu
+(flag-based polling), không dùng Linux/RTOS — thuần bare-metal.
+
+## 1. Cài toolchain
+
+```bash
+sudo apt update
+sudo apt install gcc-riscv64-unknown-elf qemu-system-misc
+```
+
+Kiểm tra QEMU hỗ trợ `ivshmem-plain`:
+```bash
+qemu-system-riscv64 -device help 2>&1 | grep -i ivshmem
+```
+
+## 2. Build
+
+```bash
+make clean && make
+```
+
+Kết quả: `node_a.elf` và `node_b.elf` (2 file ELF độc lập, cùng dùng chung
+code trong `common/` nhưng khác logic ở `main()`).
+
+## 3. Tạo file shared memory trên host
+
+`ivshmem-plain` cần một file backing trong `/dev/shm` (memory-backed
+filesystem, nhanh vì không đụng ổ đĩa). Kích thước PHẢI khớp giữa 2 lệnh
+QEMU và nên là luỹ thừa của 2:
+
+```bash
+rm -f /dev/shm/qemu-ivshmem
+truncate -s 1M /dev/shm/qemu-ivshmem
+```
+
+## 4. Chạy 2 node
+
+**Quan trọng về thứ tự khởi động:** theo thiết kế trong `node_a.c` /
+`node_b.c`, Node A là bên khởi tạo (zero-hoá) vùng nhớ chia sẻ, Node B chỉ
+chờ cờ `magic`. Vì vậy nên khởi động **Node A trước** (chênh nhau vài giây
+không sao vì Node B polling chờ magic).
+
+**Terminal 1 — Node A:**
+```bash
+qemu-system-riscv64 \
+  -M virt \
+  -m 256M \
+  -nographic \
+  -bios none \
+  -kernel node_a.elf \
+  -device ivshmem-plain,memdev=hostmem,bus=pcie.0 \
+  -object memory-backend-file,id=hostmem,share=on,mem-path=/dev/shm/qemu-ivshmem,size=1M
+```
+
+**Terminal 2 — Node B (mở ngay sau, vài giây cũng được):**
+```bash
+qemu-system-riscv64 \
+  -M virt \
+  -m 256M \
+  -nographic \
+  -bios none \
+  -kernel node_b.elf \
+  -device ivshmem-plain,memdev=hostmem,bus=pcie.0 \
+  -object memory-backend-file,id=hostmem,share=on,mem-path=/dev/shm/qemu-ivshmem,size=1M
+```
+
+### Giải thích các cờ quan trọng
+
+| Cờ | Ý nghĩa |
+|---|---|
+| `-bios none` | Bỏ qua OpenSBI, CPU vào M-mode và nhảy thẳng tới entry point của `-kernel` — bắt buộc cho bare-metal thuần tuý như ở đây. |
+| `-kernel node_a.elf` | QEMU nạp trực tiếp file ELF (không cần convert sang raw binary), dùng entry point ELF làm điểm nhảy tới. |
+| `-device ivshmem-plain,...,bus=pcie.0` | Gắn thiết bị ivshmem vào PCIe root complex mặc định của `virt` machine. |
+| `-object memory-backend-file,...,share=on` | `share=on` là điều kiện BẮT BUỘC để 2 tiến trình QEMU khác nhau cùng map chung 1 vùng nhớ vật lý qua `mmap(MAP_SHARED)` trên cùng file. |
+| `mem-path=/dev/shm/...` | Dùng tmpfs (RAM) thay vì file trên đĩa để giảm độ trễ, phù hợp yêu cầu real-time. |
+
+Thoát QEMU (khi dùng `-nographic`): `Ctrl-A` rồi `X`.
+
+## 5. Kỳ vọng output
+
+Node A (terminal 1):
+```
+=== NODE A (RISC-V) - IVSHMEM sender/counter ===
+[ivshmem] Quet PCI bus 0 tim Vendor=0x1af4 Device=0x1110...
+[ivshmem] Tim thay tai bus=0 dev=1 fn=0
+...
+[NODE A] Gui counter=1 (seq=1)
+[NODE A] Nhan response=2
+[NODE A] Gui counter=2 (seq=2)
+[NODE A] Nhan response=4
+...
+```
+
+Node B (terminal 2):
+```
+=== NODE B (RISC-V) - IVSHMEM receiver/processor ===
+[ivshmem] Quet PCI bus 0 tim Vendor=0x1af4 Device=0x1110...
+[NODE B] Da phat hien Node A. Bat dau vong lap nhan/xu ly...
+[NODE B] Nhan counter=1 (seq=1)
+[NODE B] Da gui response=2
+...
+```
+
+## 6. Các giới hạn / lưu ý kỹ thuật cần biết khi mở rộng lên RTOS thực tế
+
+1. **Không có interrupt.** `ivshmem-plain` không hỗ trợ MSI-X, nên toàn bộ
+   đồng bộ ở đây là busy-wait (polling). Nếu cần notify bất đồng bộ (ngắt
+   khi có dữ liệu mới thay vì loop-check), phải chuyển sang
+   `ivshmem-doorbell` + cấu hình PCI MSI-X + trình xử lý ngắt qua PLIC —
+   phức tạp hơn đáng kể.
+2. **Không có timeout/watchdog.** Nếu 1 node bị crash hoặc treo giữa
+   chừng, node còn lại sẽ kẹt vô hạn trong vòng `while (flag == 0)`. Hệ
+   RTOS thực tế nên đọc CLINT `mtime` (địa chỉ `0x0200BFF8` trên `virt`)
+   để thêm cơ chế timeout.
+3. **Chỉ quét bus 0, function 0.** Đủ cho topology mặc định của `virt`
+   machine với 1 thiết bị PCI gắn thêm. Nếu bạn thêm nhiều thiết bị PCI
+   khác hoặc dùng PCI-to-PCI bridge, driver `pci.c` cần được mở rộng để
+   đệ quy qua các bus con.
+4. **Giả định hệ thống < 4GB cho BAR 64-bit.** `pci_assign_bar()` luôn set
+   dword cao của BAR 64-bit = 0. Điều này đúng với cấu hình `virt` machine
+   mặc định (cửa sổ MMIO nằm trong 32-bit thấp) nhưng sẽ sai nếu bạn tuỳ
+   biến QEMU để đặt cửa sổ MMIO ở địa chỉ cao hơn 4GB.
+5. **`share=on` là bắt buộc**, nếu thiếu, mỗi tiến trình QEMU sẽ có bản
+   sao `MAP_PRIVATE` riêng của vùng nhớ (copy-on-write) — 2 node sẽ KHÔNG
+   thấy dữ liệu của nhau dù cùng trỏ tới 1 file.
