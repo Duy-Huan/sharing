@@ -1,0 +1,322 @@
+# `envtemp` – Mô hình nhiệt độ môi trường trôi ngẫu nhiên
+
+Tài liệu giới thiệu và hướng dẫn setup module `envtemp.m`: sinh nhiệt độ môi trường **không cố định**, trôi chậm và ngẫu nhiên quanh một nhiệt độ đặt (ví dụ 25 °C), để mô phỏng sát thực tế hơn việc dùng một hằng số.
+
+---
+
+## 1. Giới thiệu
+
+### 1.1 Vấn đề
+
+Trong `main.m`, nhiệt độ môi trường được đặt cố định (`config.env_temp = 25.0`). Thực tế, nhiệt độ phòng không bao giờ đứng yên: điều hòa bật tắt, người ra vào, thiết bị tỏa nhiệt, thời tiết thay đổi. Những biến động chậm này tác động lên hệ FOG qua nhiều đường, nên một mô hình nhiệt độ cố định sẽ bỏ qua một nguồn drift quan trọng.
+
+### 1.2 Giải pháp
+
+`envtemp` tạo ra nhiệt độ theo công thức:
+
+$$T(t)=T_{set}+\underbrace{\mathcal{L}\big(x(t)\big)}_{\text{ngẫu nhiên chậm}}+\underbrace{A\sin\!\Big(\tfrac{2\pi t}{P}+\varphi\Big)}_{\text{chu kỳ điều hòa}}+\underbrace{r\,t}_{\text{trôi tuyến tính}}$$
+
+| Thành phần | Mô tả | Tắt bằng |
+|---|---|---|
+| $T_{set}$ | Nhiệt độ đặt, giá trị trung bình dài hạn | (luôn có) |
+| $\mathcal{L}(x)$ | Dao động ngẫu nhiên chậm, tự kéo về $T_{set}$, bị giới hạn mềm | `sigma = 0` |
+| $A\sin(\cdot)$ | Dao động tuần hoàn của điều hòa không khí, pha ban đầu ngẫu nhiên | `hvac_amp = 0` |
+| $r\,t$ | Phòng nóng lên hoặc nguội đi từ từ | `drift_rate = 0` |
+
+Có thể bật từng thành phần riêng, để biết nguồn nhiệt nào gây ra phần drift nào ở đầu ra FOG.
+
+### 1.3 Nhiệt độ này đi vào đâu trong hệ thống
+
+Trong mô hình của bạn, biến nhiệt độ được truyền vào ba module:
+
+| Module | Ảnh hưởng của nhiệt độ |
+|---|---|
+| `sld` | Dịch bước sóng trung tâm (`TempCoeff`) |
+| `mioc` (`split`) | Suy hao theo nhiệt độ và tỷ lệ chia (`SR_TempVariation`) |
+| `fiber` (`step`) | Cập nhật phân bố nhiệt 1D trong cuộn sợi qua lớp đối lưu ngoài cùng |
+
+---
+
+## 2. Mô hình toán
+
+### 2.1 Thành phần ngẫu nhiên: quá trình Ornstein–Uhlenbeck
+
+Đây là quá trình Gauss–Markov bậc 1 (nhiễu có nhớ, mean-reverting). Dạng rời rạc hóa **chính xác** với bước thời gian $\Delta t$:
+
+$$x_n=\phi\,x_{n-1}+\sigma\sqrt{1-\phi^2}\;w_n,\qquad \phi=e^{-\Delta t/\tau_c},\quad w_n\sim\mathcal N(0,1)$$
+
+Tính chất:
+
+| Tính chất | Công thức | Ý nghĩa vật lý |
+|---|---|---|
+| Độ lệch chuẩn dừng | $\sigma$ | Nhiệt độ dao động ngẫu nhiên khoảng $\pm\sigma$ quanh $T_{set}$ |
+| Tự tương quan | $\rho(\ell)=e^{-\ell/\tau_c}$ | $\tau_c$ là "trí nhớ": sau thời gian $\tau_c$ độ tương quan còn khoảng 0.37 |
+| Xu hướng | Luôn kéo về 0 | Không trôi vô hạn khỏi nhiệt độ đặt |
+
+Trạng thái ban đầu được lấy từ phân bố dừng $x_0\sim\mathcal N(0,\sigma^2)$, nên chuỗi không có đoạn "khởi động" và thống kê đúng ngay từ mẫu đầu.
+
+Vì công thức rời rạc hóa là chính xác, kết quả **không phụ thuộc vào $\Delta t$** (miễn là $\tau_c>0$): bạn có thể dùng `dt = 1e-3` như `main.m` hoặc `dt = 1`, cùng một thống kê.
+
+### 2.2 Giới hạn mềm
+
+$$\mathcal{L}(x)=D\tanh\!\left(\frac{x}{D}\right),\qquad D=\texttt{max\_dev}$$
+
+- Khi $|x|\ll D$: $\mathcal L(x)\approx x$ (giữ nguyên).
+- Khi $|x|\to\infty$: $\mathcal L(x)\to\pm D$ (bão hòa trơn, không có góc gãy).
+- Hệ quả: độ lệch ngẫu nhiên **không bao giờ vượt $\pm D$**, nhưng độ lệch chuẩn thực thấp hơn $\sigma$ một chút do đuôi bị nén. Ví dụ `sigma = 0.5`, `max_dev = 2` cho độ lệch chuẩn đo được khoảng 0.47. Nếu cần đúng $\sigma$, tăng `max_dev` (ví dụ gấp 5 đến 6 lần $\sigma$) hoặc đặt `max_dev = 0` để tắt giới hạn.
+
+### 2.3 Chu kỳ điều hòa và trôi tuyến tính
+
+- Sóng sin biên độ `hvac_amp`, chu kỳ `hvac_period`, pha ban đầu $\varphi$ ngẫu nhiên trong $[0,2\pi)$ (bốc mới mỗi lần `reset`). Đóng góp độ lệch chuẩn khoảng $A/\sqrt2$.
+- Trôi tuyến tính: `drift_rate` tính theo **°C trên giờ**, hàm tự đổi sang °C trên giây.
+
+### 2.4 Độ lệch chuẩn tổng ước lượng
+
+Khi các thành phần độc lập:
+
+$$\sigma_T\approx\sqrt{\sigma_{\text{eff}}^2+\frac{A^2}{2}}\quad(\text{chưa tính trôi}),\qquad \sigma_{\text{eff}}\lesssim\sigma$$
+
+Lưu ý giới hạn mềm chỉ áp dụng cho thành phần ngẫu nhiên. **Tổng nhiệt độ có thể vượt $T_{set}\pm D$** khi bật điều hòa hoặc trôi, vì hai thành phần này cộng thêm vào sau.
+
+---
+
+## 3. Cài đặt
+
+### 3.1 Đặt file
+
+Đặt `envtemp.m` cùng nơi với các module khác (ví dụ thư mục `optical/` mà `main.m` đã `addpath`):
+
+```
+project/
+├── main.m
+├── config.json          (tùy chọn, xem 3.2)
+└── optical/
+    ├── sld.m  te.m  coupler.m  mioc.m  fiber.m  photodetector.m
+    └── envtemp.m        <-- thêm vào đây
+```
+
+Chỉ cần MATLAB cơ bản (dùng `filter`, `randn`, `rand`, `tanh`), không cần toolbox.
+
+### 3.2 Cấu hình qua `config.json` (tùy chọn)
+
+Giống các module khác của bạn, thêm một mục `envtemp`:
+
+```json
+{
+  "envtemp": {
+    "setpoint":    25.0,
+    "sigma":       0.5,
+    "tau_corr":    600,
+    "max_dev":     2.0,
+    "hvac_amp":    0.3,
+    "hvac_period": 900,
+    "drift_rate":  0.0
+  }
+}
+```
+
+Khi gọi `envtemp([], dt)` hoặc `envtemp()` không truyền struct, hàm tự đọc `config.json` (nếu có và có mục `envtemp`). Trường nào thiếu sẽ dùng giá trị mặc định. Nếu không có file thì dùng toàn bộ mặc định.
+
+### 3.3 Cấu hình trực tiếp bằng struct
+
+```matlab
+cfg.setpoint = 25;  cfg.sigma = 0.3;  cfg.tau_corr = 900;
+obj_env = envtemp(cfg, config.dt);      % các trường không khai báo dùng mặc định
+```
+
+---
+
+## 4. Tích hợp vào `main.m`
+
+### 4.1 Cách 1: sinh sẵn cả mảng (khuyến nghị, nhanh)
+
+Trước vòng lặp:
+
+```matlab
+%% Environment temperature model
+env_cfg.setpoint    = config.env_temp;   % dùng lại nhiệt độ đặt hiện có
+env_cfg.sigma       = 0.5;
+env_cfg.tau_corr    = 600;
+env_cfg.max_dev     = 2.0;
+env_cfg.hvac_amp    = 0.3;
+env_cfg.hvac_period = 900;
+env_cfg.drift_rate  = 0.0;
+obj_env   = envtemp(env_cfg, config.dt);
+env_temps = obj_env.generate(config.numberOfSample);   % vector N x 1
+env_temp_log = zeros(1, config.numberOfSample);
+```
+
+Trong vòng lặp, thay mọi chỗ dùng `config.env_temp` làm đầu vào nhiệt độ bằng `T_env`, giữ nguyên thứ tự đối số theo `main.m` của bạn:
+
+```matlab
+for sample = 1:config.numberOfSample
+    T_env = env_temps(sample);
+
+    sig_sld = obj_sld.step(config.sld_current, T_env);
+    ...
+    [sig_cw_in, sig_ccw_in] = obj_mioc.split(sig_te2, config.V_mod, T_env);
+    ... = obj_fiber.step(..., T_env, ...);     % chỉ thay biến nhiệt độ
+    ...
+    env_temp_log(sample) = T_env;              % lưu để phân tích về sau
+end
+```
+
+Bộ nhớ: $10^7$ mẫu chiếm khoảng 80 MB cho mảng `env_temps`, chấp nhận được. Nếu cần ít hơn, xem 4.3.
+
+### 4.2 Cách 2: sinh từng mẫu
+
+```matlab
+T_env = obj_env.step();     % ngay trong vòng lặp, mỗi lần một mẫu
+```
+
+Cùng phân bố thống kê với Cách 1 nhưng chậm hơn.
+
+### 4.3 Cách 3: sinh theo khối (tiết kiệm bộ nhớ)
+
+`generate` **nối tiếp trạng thái** giữa các lần gọi, nên chia khối không làm gãy chuỗi:
+
+```matlab
+blk = 1e6;
+for b0 = 1:blk:config.numberOfSample
+    nb = min(blk, config.numberOfSample - b0 + 1);
+    Tb = obj_env.generate(nb);
+    for i = 1:nb
+        T_env = Tb(i);
+        sample = b0 + i - 1;
+        ... % xử lý như trên
+    end
+end
+```
+
+Đã kiểm tra: bước nhảy giữa hai khối liên tiếp chỉ cỡ 0.01 °C.
+
+---
+
+## 5. Tham chiếu API
+
+### 5.1 Tham số
+
+| Trường config | Thuộc tính | Mặc định | Đơn vị | Ý nghĩa |
+|---|---|---|---|---|
+| `setpoint` | `Setpoint` | 25.0 | °C | Nhiệt độ đặt |
+| `sigma` | `Sigma` | 0.5 | °C | Độ lệch chuẩn thành phần ngẫu nhiên |
+| `tau_corr` | `TauCorr` | 600 | s | Thời gian tương quan (phải lớn hơn 0) |
+| `max_dev` | `MaxDev` | 2.0 | °C | Giới hạn mềm của độ lệch ngẫu nhiên, `0` là tắt |
+| `hvac_amp` | `HvacAmp` | 0.3 | °C | Biên độ chu kỳ điều hòa, `0` là tắt |
+| `hvac_period` | `HvacPeriod` | 900 | s | Chu kỳ điều hòa |
+| `drift_rate` | `DriftRate` | 0.0 | °C/giờ | Tốc độ trôi tuyến tính |
+
+Tham số thứ hai của constructor là `dt` (giây). Nếu bỏ qua, mặc định `1e-3`.
+
+### 5.2 Phương thức
+
+| Phương thức | Mô tả |
+|---|---|
+| `obj = envtemp(config, dt)` | Tạo đối tượng và gọi `reset()` |
+| `obj.reset()` | Bốc lại trạng thái ngẫu nhiên từ phân bố dừng, đặt $t=0$, bốc pha điều hòa mới |
+| `T = obj.step()` | Một mẫu nhiệt độ (vô hướng), tăng thời gian thêm `dt` |
+| `T = obj.generate(N)` | `N` mẫu liên tiếp (vector cột N×1), tiếp nối trạng thái và thời gian hiện tại |
+
+`step` và `generate` có thể dùng xen kẽ; cả hai cùng cập nhật trạng thái bên trong.
+
+---
+
+## 6. Chọn tham số
+
+### 6.1 Kịch bản đã thử
+
+| Kịch bản | `sigma` | `tau_corr` | `max_dev` | `hvac_amp` / `hvac_period` | `drift_rate` | Phù hợp với |
+|---|---|---|---|---|---|---|
+| **A** Mặc định | 0.5 | 600 | 2 | 0.3 / 900 | 0 | Phòng thí nghiệm bình thường |
+| **B** Phòng ổn định | 0.2 | 300 | 1 | 0.3 / 600 | 0 | Phòng có điều hòa chính xác |
+| **C** Không ổn định | 1.5 | 1800 | 4 | 0 / (bỏ) | 0.5 | Điều kiện xấu, ngoài trời, phòng nóng dần |
+
+Đồ thị minh họa nằm trong `envtemp_preview.png`.
+
+### 6.2 Hướng dẫn chọn
+
+- **`tau_corr`** là tham số quan trọng nhất. Nhỏ (vài giây) cho nhiệt độ nhiễu nhanh; lớn (hàng trăm đến hàng nghìn giây) cho dao động chậm, gần đúng với phòng thật. Cuộn sợi trong mô hình có quán tính nhiệt lớn, nên chỉ các biến động đủ chậm mới đi sâu vào lõi cuộn.
+- **`sigma`**: cỡ vài phần mười °C cho phòng có điều hòa, cỡ 1 °C trở lên cho môi trường kém ổn định.
+- **`hvac_period`**: chọn chu kỳ đóng ngắt thực của điều hòa (vài phút đến vài chục phút). Một chu kỳ cố định tạo thành phần tuần hoàn, sẽ lộ ra trong phổ và ADEV.
+- **`drift_rate`**: dùng khi muốn thử drift một chiều dài hạn. Thành phần này không bị giới hạn mềm.
+- **Thời gian mô phỏng nên lớn hơn vài lần `tau_corr`**, nếu không bạn chỉ thấy một đoạn ngắn của quá trình và thống kê sẽ lệch.
+
+---
+
+## 7. Kết quả kiểm chứng
+
+Module được chạy thật bằng GNU Octave 8.4.
+
+| Kiểm tra | Kết quả |
+|---|---|
+| Độ lệch chuẩn (đặt 0.5, giới hạn mềm ±2) | 0.502 (`generate`, 1e6 mẫu), 0.497 (`step`, 2e5 mẫu) |
+| Độ lệch chuẩn khi chỉ có phần ngẫu nhiên (2e6 mẫu) | 0.466 (thấp hơn $\sigma$ do giới hạn mềm) |
+| Phạm vi | 23.61 đến 26.25 °C, trong ±2 °C của giới hạn |
+| Tự tương quan tại lag bằng `tau_corr` | 0.345 (lý thuyết 0.368) |
+| Liên tục giữa hai lần gọi `generate` | Bước nhảy 0.009 °C |
+| Chu kỳ + trôi 0.5 °C/giờ trong 1 giờ | Nhiệt độ tăng khoảng 1.2 °C (gồm trôi 0.5 °C và dao động ngẫu nhiên) |
+| `dt = 1e-3`, 1e6 mẫu (1000 s) | Hữu hạn, từ 24.31 đến 25.86 °C |
+| Kịch bản A / B / C, 6 giờ | std lần lượt 0.53 / 0.27 / 2.05 °C |
+
+Hai ghi chú: các kịch bản mô phỏng dùng seed cố định để hình có thể tái lập, và chưa có phép kiểm thử bằng MATLAB thật (chỉ Octave).
+
+---
+
+## 8. Tái lập và nhiều lần chạy
+
+- **Tái lập kết quả:** đặt seed trước khi tạo đối tượng: `rng(42); obj_env = envtemp(cfg, dt);`. Cả `randn` (trạng thái ngẫu nhiên) và `rand` (pha điều hòa) đều phụ thuộc seed.
+- **Monte Carlo:** gọi `obj_env.reset()` giữa các lần chạy để bốc lại trạng thái và pha điều hòa mới, hoặc tạo đối tượng mới với seed khác.
+- **Giữ nguyên nhiệt độ giữa các lần so sánh:** nếu muốn so sánh hai cấu hình hệ thống dưới cùng một kịch bản nhiệt, sinh `env_temps` một lần, lưu lại, rồi dùng chung cho cả hai lần chạy.
+
+---
+
+## 9. Dùng cùng phân tích Allan
+
+Nhiệt độ môi trường thay đổi sẽ sinh drift phụ thuộc nhiệt trong đầu ra FOG. Gợi ý khi phân tích bằng `allan_analysis`:
+
+1. Chạy hai lần: nhiệt độ cố định và nhiệt độ có `envtemp`, rồi so sánh hai đường ADEV để thấy phần đóng góp của nhiệt.
+2. Lưu `env_temp_log`, vẽ cùng với đầu ra để tìm tương quan thời gian.
+3. Các biến động nhiệt độ có thời gian đặc trưng cỡ `tau_corr` và `hvac_period`, nên ảnh hưởng thường hiện ra ở τ dài cùng cỡ đó. Chu kỳ điều hòa tuần hoàn có thể tạo gợn dao động trên đường ADEV.
+4. Dùng `'Detrend','linear'` hoặc `'poly2'` khi bật `drift_rate`, vì drift tuyến tính làm đường ADEV đi lên với độ dốc +1 và che mất BI.
+
+---
+
+## 10. Giới hạn của mô hình
+
+1. **Đây là mô hình thống kê, không phải mô hình vật lý của căn phòng.** Không mô phỏng trao đổi nhiệt, công suất điều hòa hay sự kiện cụ thể.
+2. **Không có bước nhảy đột ngột** (mở cửa, bật thiết bị). Có thể thêm bước nhảy nhiệt nếu bạn cần.
+3. **Thành phần ngẫu nhiên là dừng và Gauss** (trước khi bị giới hạn mềm): không có xu hướng theo thời gian trong ngày, ngoài thành phần `drift_rate` tuyến tính tuyệt đối.
+4. **Giới hạn mềm chỉ áp lên thành phần ngẫu nhiên**, không áp lên tổng.
+5. **Một tần số điều hòa duy nhất**: thực tế có thể có nhiều chu kỳ chồng lên nhau.
+6. **`tau_corr` phải lớn hơn 0**; nếu `dt` lớn hơn nhiều so với `tau_corr`, quá trình gần như nhiễu trắng từng mẫu (không còn "trôi chậm").
+
+---
+
+## 11. Xử lý sự cố
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách xử lý |
+|---|---|---|
+| Độ lệch chuẩn đo được thấp hơn `sigma` | Giới hạn mềm nén đuôi, hoặc bản ghi quá ngắn so với `tau_corr` | Tăng `max_dev` hoặc đặt `0`; chạy dài hơn |
+| Nhiệt độ vượt $T_{set}\pm$`max_dev` | Đã bật `hvac_amp` hoặc `drift_rate` | Bình thường: giới hạn chỉ áp lên phần ngẫu nhiên |
+| Mỗi lần chạy ra kết quả khác nhau | Không đặt seed | Dùng `rng(seed)` trước khi tạo đối tượng |
+| Đầu ra FOG không đổi dù bật `envtemp` | Nhiệt độ chưa được truyền vào module, hoặc dao động quá nhanh và quá nhỏ so với quán tính nhiệt cuộn | Kiểm tra `T_env` đã thay vào các lệnh gọi; thử `tau_corr` và `sigma` lớn hơn |
+| Lỗi thiếu trường config | Dùng struct tự tạo có tên trường khác | Dùng đúng tên trường ở mục 5.1 (trường thiếu sẽ lấy mặc định, tên sai sẽ bị bỏ qua) |
+| Chạy `generate` với N rất lớn bị hết bộ nhớ | $10^7$ mẫu cần khoảng 80 MB, nhiều bản sao tạm thời | Dùng cách sinh theo khối (mục 4.3) |
+
+---
+
+## 12. Ví dụ tối thiểu
+
+```matlab
+rng(1);
+cfg.setpoint = 25;  cfg.sigma = 0.5;  cfg.tau_corr = 600;
+cfg.max_dev  = 2;   cfg.hvac_amp = 0.3;  cfg.hvac_period = 900;
+
+obj = envtemp(cfg, 1);                 % dt = 1 s
+T   = obj.generate(6*3600);            % 6 giờ
+
+t = (0:numel(T)-1)'/3600;
+plot(t, T); xlabel('time (h)'); ylabel('T (^\circC)'); grid on;
+fprintf('mean = %.2f, std = %.2f, range = [%.2f, %.2f]\n', ...
+        mean(T), std(T), min(T), max(T));
+```
