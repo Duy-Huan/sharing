@@ -1,0 +1,119 @@
+1;
+graphics_toolkit('gnuplot');
+outdir = '/home/claude/t/out'; if ~exist(outdir,'dir'), mkdir(outdir); end
+
+function x = gen_flicker(N, dt, B)
+% 1/f noise with ADEV plateau = sqrt(2*ln2/pi)*B
+k = (1:N/2)'; f = k/(N*dt);
+H = sqrt(B^2./(2*pi*f)/dt);   % calibrated so ADEV plateau = 0.6643*B (checked vs allantools)
+Hf = [0; H(1:N/2-1); H(N/2); flipud(H(1:N/2-1))];
+x = real(ifft(fft(randn(N,1)).*Hf));
+end
+function c = coverage(res, model)
+rel = (res.ci_hi - res.ci_lo)./(2*res.adev);
+c = mean(abs(res.adev./model - 1) <= 3*rel);
+end
+function savefig_(name)
+print(gcf, ['/home/claude/t/out/' name '.png'], '-dpng', '-r85'); close(gcf);
+end
+function rec = rec_(name, pass, info)
+rec = struct('name',name,'pass',pass,'info',info);
+fprintf('>>> [%s] %s | %s\n', ifelse_(pass,'PASS','FAIL'), name, info);
+end
+function s = ifelse_(c,a,b), if c, s=a; else, s=b; end, end
+
+K = 0.6643;  % sqrt(2 ln2/pi)
+recs = {};
+
+%% S1 white noise (ARW)
+randn('state',11); dt=1e-3; N=1e6; sg=0.01;
+y = sg*randn(N,1); model = sg*sqrt(dt)./sqrt((1:0)'); 
+r = allan_analysis(y,dt,'Detrend','mean','Units','a.u.'); savefig_('S1_white');
+model = sg*sqrt(dt./r.tau); cov = coverage(r,model);
+ok = abs(r.N_arw/(sg*sqrt(dt))-1)<0.05 && ~r.hasMin && ~r.hasPlateau && cov>=0.95;
+recs{end+1} = rec_('S1 white noise (ARW)', ok, sprintf('N_est/N_true=%.3f, coverage(3sigma)=%.2f, hasMin=%d, verdict: %s', r.N_arw/(sg*sqrt(dt)), cov, r.hasMin, r.verdict));
+y1 = y; r1 = r;
+
+%% S2 rate random walk
+randn('state',12); dt=1e-2; N=1e6; ss=1e-4;
+y = cumsum(ss*randn(N,1)); Ktrue = ss/sqrt(dt);
+r = allan_analysis(y,dt,'Detrend','none'); savefig_('S2_rrw');
+model = Ktrue*sqrt(r.tau/3); cov = coverage(r,model);
+ok = abs(r.K_rrw/Ktrue-1)<0.15 && ~r.hasMin && cov>=0.8;
+recs{end+1} = rec_('S2 rate random walk (RRW)', ok, sprintf('K_est/K_true=%.3f, coverage=%.2f, hasMin=%d, verdict: %s', r.K_rrw/Ktrue, cov, r.hasMin, r.verdict));
+
+%% S3 rate ramp
+dt=1e-2; N=1e6; R=1e-4; t=(0:N-1)'*dt; y=R*t;
+r = allan_analysis(y,dt,'Detrend','none'); savefig_('S3_ramp');
+model = R*r.tau/sqrt(2); cov = coverage(r,model);
+ok = abs(r.R_rr/R-1)<0.05 && ~r.hasMin && max(abs(r.adev./model-1))<0.02;
+recs{end+1} = rec_('S3 rate ramp', ok, sprintf('R_est/R_true=%.3f, max|adev/model-1|=%.4f, verdict: %s', r.R_rr/R, max(abs(r.adev./model-1)), r.verdict));
+
+%% S4 classic: ARW + true 1/f + RRW
+randn('state',14); dt=0.1; N=2^21; B=0.01; sw=0.05; Kr=2e-4;
+y = sw*randn(N,1) + gen_flicker(N,dt,B) + cumsum(Kr*sqrt(dt)*randn(N,1));
+r = allan_analysis(y,dt,'Detrend','mean','Units','a.u.'); savefig_('S4_classic_BI');
+Nw = sw*sqrt(dt);
+model = sqrt(Nw^2./r.tau + (K*B)^2 + Kr^2*r.tau/3); cov = coverage(r,model);
+[mm,~] = min(model); BImodel = mm/K;
+ok = r.hasPlateau && abs(r.BI/BImodel-1)<0.15 && cov>=0.85;
+recs{end+1} = rec_('S4 ARW + 1/f + RRW (classic BI)', ok, sprintf('BI_est=%.4g, BI_from_model_min=%.4g, B_true=%.4g, plateau=%.2f dec, coverage=%.2f, verdict: %s', r.BI, BImodel, B, r.plateau_decades, cov, r.verdict));
+y4 = y;
+
+%% S5 user's flicker only (IIR, alpha=0.995), dt=1e-3
+randn('state',15); dt=1e-3; N=2e6; a=0.995; Bb=0.0224;
+y = Bb*sqrt(dt)*filter(1-a,[1 -a],randn(N,1)); tc = -dt/log(a);
+r = allan_analysis(y,dt,'Detrend','mean'); savefig_('S5_user_flicker_only');
+ok = r.hasPeak && abs(r.tauc_est/tc-1)<0.3 && ~r.hasPlateau;
+recs{end+1} = rec_('S5 user IIR flicker only', ok, sprintf('hasPeak=%d, tau_peak=%.3g s, Tc_est=%.3g s (true %.3g s), hasMin=%d, verdict: %s', r.hasPeak, r.tau_peak, r.tauc_est, tc, r.hasMin, r.verdict));
+
+%% S6 user main.m noise set: flicker + RRW(1e-4) + RR(1e-5), dt=1e-3
+randn('state',16); dt=1e-3; N=2e6; t=(0:N-1)'*dt;
+y = Bb*sqrt(dt)*filter(1-a,[1 -a],randn(N,1)) + cumsum(1e-4*sqrt(dt)*randn(N,1)) + 1e-5*t;
+r = allan_analysis(y,dt,'Detrend','mean'); savefig_('S6_user_main_noise_set');
+ok = ~r.hasPlateau;
+recs{end+1} = rec_('S6 main.m noise set (RRW+RR on)', ok, sprintf('hasMin=%d, hasPeak=%d, K_est=%.3g (true 1e-4), R_est=%.3g (true 1e-5), verdict: %s', r.hasMin, r.hasPeak, r.K_rrw, r.R_rr, r.verdict));
+
+%% S7 user flicker + small white noise
+randn('state',17); dt=1e-3; N=2e6; sw=3e-5;
+y = Bb*sqrt(dt)*filter(1-a,[1 -a],randn(N,1)) + sw*randn(N,1);
+r = allan_analysis(y,dt,'Detrend','mean'); savefig_('S7_user_flicker_plus_white');
+ok = r.hasPeak && abs(r.tauc_est/tc-1)<0.3;
+recs{end+1} = rec_('S7 user IIR flicker + white', ok, sprintf('hasMin=%d, hasPlateau=%d, hasPeak=%d, tau_peak=%.3g, Tc_est=%.3g (true %.3g), N_est=%.3g (true %.3g), verdict: %s', r.hasMin, r.hasPlateau, r.hasPeak, r.tau_peak, r.tauc_est, tc, r.N_arw, sw*sqrt(dt), r.verdict));
+
+%% S8 deterministic drift: S4 noise + linear drift, detrend options
+dt=0.1; N=2^21; t=(0:N-1)'*dt; yd = y4 + 1e-4*t;
+rm = allan_analysis(yd,dt,'Detrend','mean');   savefig_('S8a_drift_detrend_mean');
+rl = allan_analysis(yd,dt,'Detrend','linear'); savefig_('S8b_drift_detrend_linear');
+rp = allan_analysis(yd,dt,'Detrend','poly2','Plot',false);
+ok = rl.hasPlateau && rp.hasPlateau && (rl.plateau_decades > rm.plateau_decades + 0.5) && rm.BI > rl.BI && abs(rl.BI/BImodel-1)<0.15;
+recs{end+1} = rec_('S8 drift: mean vs linear vs poly2 detrend', ok, sprintf('mean: plateau=%.2f dec, BI=%.4g | linear: plateau=%.2f dec, BI=%.4g | poly2: plateau=%.2f dec, BI=%.4g | BI_model=%.4g', rm.plateau_decades, rm.BI, rl.plateau_decades, rl.BI, rp.plateau_decades, rp.BI, BImodel));
+
+%% S9 consistency: angle vs rate, scale linearity
+dt=1e-3; yy = y1(1:2e5);
+ra = allan_analysis(yy,dt,'Detrend','none','Plot',false);
+rb = allan_analysis([0;cumsum(yy)*dt],dt,'Type','angle','Detrend','none','Plot',false);
+rc = allan_analysis(yy,dt,'Detrend','none','Scale',3600,'Plot',false);
+e1 = max(abs(ra.adev./rb.adev(1:numel(ra.adev))-1)); e2 = max(abs(rc.adev./(3600*ra.adev)-1));
+ok = numel(ra.tau)==numel(rb.tau) && e1<1e-6 && e2<1e-12;
+recs{end+1} = rec_('S9 rate-vs-angle equivalence & Scale linearity', ok, sprintf('same taus=%d, max rel diff rate/angle=%.2e, scale=%.2e', numel(ra.tau)==numel(rb.tau), e1, e2));
+
+%% S10 export for independent check (allantools)
+ex = {}; 
+r10a = allan_analysis(y1(1:5e5),1e-3,'Detrend','none','Plot',false);
+r10b = allan_analysis(y4,0.1,'Detrend','none','Plot',false);
+fid=fopen('/home/claude/t/d_white.bin','w'); fwrite(fid,y1(1:5e5),'double'); fclose(fid);
+fid=fopen('/home/claude/t/d_s4.bin','w');    fwrite(fid,y4,'double'); fclose(fid);
+dlmwrite('/home/claude/t/tau_white.csv',[r10a.tau r10a.adev],'precision',12);
+dlmwrite('/home/claude/t/tau_s4.csv',[r10b.tau r10b.adev],'precision',12);
+
+%% S11 error handling
+e = 0;
+try, allan_analysis([1 NaN 3 4],1); catch, e=e+1; end
+try, allan_analysis(randn(50,1),1); catch, e=e+1; end
+try, allan_analysis(randn(1000,1),1,'Detrend','bogus'); catch, e=e+1; end
+recs{end+1} = rec_('S11 input validation (NaN / short / bad option)', e==3, sprintf('%d of 3 invalid calls raised errors', e));
+
+fid=fopen('/home/claude/t/out/summary.txt','w');
+for i=1:numel(recs), fprintf(fid,'%s\t%s\t%s\n', ifelse_(recs{i}.pass,'PASS','FAIL'), recs{i}.name, recs{i}.info); end
+fclose(fid);
