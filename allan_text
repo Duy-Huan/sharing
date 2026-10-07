@@ -1,0 +1,259 @@
+# `allan_analysis` – Hướng dẫn sử dụng và phương pháp tính
+
+Tài liệu mô tả hàm MATLAB `allan_analysis.m`: tính **Allan deviation (ADEV)** dạng overlapping, vẽ đồ thị và kiểm tra tự động tín hiệu có **Bias Instability (BI)** hay không. Hàm chỉ dùng MATLAB cơ bản (cần `movmean`, R2016a trở lên), không cần toolbox.
+
+---
+
+## 1. Tóm tắt nhanh
+
+```matlab
+res = allan_analysis(data, dt);                                  % mặc định
+res = allan_analysis(data, dt, 'Detrend','linear','Units','A');  % có tuỳ chọn
+```
+
+| Đầu vào | Ý nghĩa |
+|---|---|
+| `data` | Vector tín hiệu lấy mẫu đều (ví dụ `photocurrents`) |
+| `dt` | Chu kỳ lấy mẫu (giây) |
+
+Hàm trả về struct `res` (mục 4), in tóm tắt ra Command Window và (mặc định) vẽ hai đồ thị: đường ADEV và độ dốc cục bộ.
+
+---
+
+## 2. Tham số (Name–Value)
+
+| Tên | Mặc định | Giá trị | Tác dụng |
+|---|---|---|---|
+| `'Type'` | `'rate'` | `'rate'`, `'angle'` | `'rate'`: dữ liệu là tốc độ (hàm tự tích phân thành góc). `'angle'`: dữ liệu đã là góc/pha tích phân |
+| `'Scale'` | `1` | số vô hướng | Nhân dữ liệu trước khi tính (ví dụ hệ số quy đổi sang °/h) |
+| `'Detrend'` | `'mean'` | `'none'`, `'mean'`, `'linear'`, `'poly2'` | Loại bỏ thành phần tất định trước khi tính |
+| `'Units'` | `'a.u.'` | chuỗi | Nhãn đơn vị trên đồ thị và log |
+| `'NumPoints'` | `150` | số nguyên | Số điểm τ chia đều theo thang log. Giảm để chạy nhanh hơn |
+| `'MinClusters'` | `9` | số | τ dài nhất = độ dài bản ghi / `MinClusters`. Càng lớn, τ cuối càng ngắn nhưng độ tin cậy càng tốt |
+| `'SlopeTol'` | `0.15` | số | Độ dốc log-log có \|dốc\| ≤ giá trị này được coi là "phẳng" |
+| `'MinPlateauDecades'` | `0.3` | số (decade) | Vùng phẳng phải rộng ít nhất chừng này mới kết luận có BI |
+| `'Plot'` | `true` | `true`/`false` | Tắt khi gọi trong vòng lặp sweep |
+
+### Chọn `Detrend`
+
+| Giá trị | Dùng khi |
+|---|---|
+| `'none'` | Bạn muốn giữ nguyên mọi thành phần, kể cả ramp (ví dụ khi kiểm tra Rate Ramp) |
+| `'mean'` | Tín hiệu tĩnh, chỉ cần bỏ offset |
+| `'linear'` | Có drift tuyến tính (nhiệt, ramp chậm) |
+| `'poly2'` | Drift cong nhẹ |
+
+Lưu ý: detrend chỉ nên bỏ thành phần **tất định**. Nó không loại được RRW (ngẫu nhiên), nên không thể "làm đẹp" đuôi ADEV do RRW.
+
+---
+
+## 3. Ví dụ sử dụng
+
+### 3.1 Tích hợp vào `main.m` (case quay không đổi)
+
+```matlab
+n0   = floor(config.numberOfSample/20);       % bỏ đoạn quá độ nhiệt đầu bản ghi
+data = photocurrents(n0:end);
+
+res = allan_analysis(data, config.dt, ...
+        'Type','rate', 'Detrend','linear', 'Units','A', 'NumPoints',100);
+```
+
+### 3.2 Quy đổi sang °/h
+
+Nếu `K_scale` là hệ số nhân đưa dữ liệu về °/h (từ bước hiệu chuẩn):
+
+```matlab
+res = allan_analysis(data, dt, 'Scale', K_scale, 'Units', 'deg/h');
+```
+
+### 3.3 Dùng trong vòng sweep
+
+```matlab
+for k = 1:numel(levels)
+    out = run_something(levels(k));
+    r   = allan_analysis(out, dt, 'Detrend','linear', 'Plot', false);
+    BI_after(k)  = r.BI;           % NaN nếu không tìm thấy cực tiểu
+    hasBI(k)     = r.hasPlateau;
+end
+```
+
+### 3.4 Đọc kết quả
+
+```matlab
+res.verdict                         % kết luận dạng chữ
+if res.hasPlateau, res.BI, res.tau_BI, end
+if res.hasPeak,    res.tau_peak, res.tauc_est, end
+loglog(res.tau, res.adev)           % vẽ lại theo ý bạn
+```
+
+---
+
+## 4. Đầu ra `res`
+
+| Trường | Ý nghĩa |
+|---|---|
+| `tau`, `adev` | Vector τ (s) và ADEV (cùng đơn vị với dữ liệu sau `Scale`) |
+| `ci_lo`, `ci_hi` | Dải tin cậy xấp xỉ 1σ của ADEV |
+| `slope` | Độ dốc log-log cục bộ (đã làm mượt) |
+| `hasMin` | Có cực tiểu nằm bên trong dải τ |
+| `hasPlateau` | Có vùng phẳng đủ rộng quanh cực tiểu (điều kiện kết luận BI) |
+| `plateau_decades` | Bề rộng vùng phẳng, tính theo decade của τ |
+| `BI`, `tau_BI` | BI ước lượng và τ tại cực tiểu (NaN nếu `hasMin = false`) |
+| `hasPeak` | Có đỉnh (bump) của nhiễu tương quan |
+| `tau_peak`, `tauc_est` | τ tại đỉnh và hằng số thời gian tương quan ước lượng |
+| `N_arw`, `K_rrw`, `R_rr` | Hệ số ARW, RRW, Rate Ramp ước lượng (NaN nếu không có vùng dốc tương ứng) |
+| `verdict` | Chuỗi kết luận |
+
+---
+
+## 5. Phương pháp tính
+
+### 5.1 Tiền xử lý
+
+1. Dữ liệu được nhân `Scale`, kiểm tra không có NaN/Inf, độ dài tối thiểu 100 mẫu.
+2. Detrend: trừ trung bình hoặc đa thức bậc 1/2 (biến thời gian chuẩn hoá về $[-1,1]$ để ổn định số).
+3. Nếu `Type = 'rate'`, tích phân thành góc:
+
+$$\theta_0 = 0,\qquad \theta_k = \Delta t \sum_{i=1}^{k} y_i$$
+
+Nếu `Type = 'angle'`, dữ liệu được dùng trực tiếp làm $\theta$.
+
+### 5.2 Allan deviation overlapping
+
+Với kích thước cụm $m$ mẫu, thời gian lấy trung bình $\tau = m\,\Delta t$:
+
+$$\sigma^2(\tau)=\frac{1}{2\,\tau^{2}\,(N_\theta-2m)}\sum_{k=1}^{N_\theta-2m}\left(\theta_{k+2m}-2\theta_{k+m}+\theta_{k}\right)^2$$
+
+Dạng tương đương theo trung bình cụm (đã dùng để kiểm chéo trong test), với $\bar y_i$ là trung bình $m$ mẫu liên tiếp bắt đầu từ $i$:
+
+$$\sigma^2(\tau)=\frac{1}{2\,(N-2m+1)}\sum_{i}\left(\bar y_{i+m}-\bar y_{i}\right)^2$$
+
+- "Overlapping" nghĩa là các cụm trượt từng mẫu một, dùng hết dữ liệu nên ước lượng ổn định hơn kiểu không chồng lấn.
+- Các $m$ được chọn từ 1 đến $\lfloor N/\text{MinClusters}\rfloor$, chia đều theo thang log (`logspace`), rồi làm tròn và loại giá trị trùng.
+- Độ phức tạp tỷ lệ $O(M\cdot N)$ với $M$ là số điểm τ. Bản ghi $10^7$ mẫu với 100 điểm τ chạy vài chục giây đến vài phút.
+
+### 5.3 Dải tin cậy
+
+Sai số tương đối xấp xỉ:
+
+$$\varepsilon(\tau)\approx\frac{1}{\sqrt{2\,(N/m-1)}}$$
+
+Dải: $\sigma(\tau)\,(1\pm\varepsilon)$. Đây là xấp xỉ 1σ, không phải khoảng tin cậy chính xác theo bậc tự do hiệu dụng. Dải rộng dần về phía τ dài, nơi có ít cụm độc lập.
+
+### 5.4 Độ dốc log-log
+
+Đường cong được làm mượt bằng trung bình trượt cửa sổ 5 điểm trên $\log_{10}\sigma$, sau đó:
+
+$$s(\tau)=\frac{d\log_{10}\sigma}{d\log_{10}\tau}$$
+
+được tính bằng sai phân theo trục $\log_{10}\tau$ (có khoảng cách không đều) và làm mượt thêm một lần bằng cửa sổ 5 điểm.
+
+### 5.5 Họ nhiễu và độ dốc đặc trưng
+
+| Nhiễu | Độ dốc | Công thức ADEV | Hệ số đọc ra |
+|---|---|---|---|
+| Quantization | $-1$ | $\sigma=\sqrt3\,Q/\tau$ | (hàm không ước lượng) |
+| Angle Random Walk (ARW) | $-1/2$ | $\sigma=N/\sqrt\tau$ | $N=\sigma\sqrt\tau$ |
+| Bias Instability (1/f) | $0$ | $\sigma\approx 0.6643\,B$ | $B=\sigma_{\min}/0.6643$ |
+| Rate Random Walk (RRW) | $+1/2$ | $\sigma=K\sqrt{\tau/3}$ | $K=\sigma\sqrt{3/\tau}$ |
+| Rate Ramp | $+1$ | $\sigma=R\,\tau/\sqrt2$ | $R=\sigma\sqrt2/\tau$ |
+
+Hệ số $0.6643=\sqrt{2\ln2/\pi}$ theo IEEE Std 952, là tỷ số giữa đáy ADEV và hệ số $B$ của nhiễu 1/f lý tưởng.
+
+Các nhiễu độc lập cộng theo bình phương:
+
+$$\sigma^2_{\text{tổng}}(\tau)=\frac{N^2}{\tau}+(0.6643\,B)^2+\frac{K^2\tau}{3}+\frac{R^2\tau^2}{2}+\dots$$
+
+Đó là lý do đường ADEV thực có dạng "chữ U": ARW kéo xuống ở τ ngắn, BI tạo đáy, RRW/RR kéo lên ở τ dài.
+
+### 5.6 Nhận diện cực tiểu và vùng phẳng (BI)
+
+1. Điểm $k$ là chỉ số của giá trị nhỏ nhất của đường đã làm mượt.
+2. `hasMin` đúng khi $k$ nằm cách cả hai đầu ít nhất 2 điểm và đường cong thực sự đi xuống trước đó (giảm hơn khoảng 1.1 lần so với điểm đầu). Điều kiện này loại trường hợp đường cong chỉ đơn điệu.
+3. Từ $k$, mở rộng sang trái và phải chừng nào $|s|\le$ `SlopeTol`. Bề rộng thu được tính theo decade:
+
+$$w=\log_{10}\tau_{\text{phải}}-\log_{10}\tau_{\text{trái}}$$
+
+4. `hasPlateau` đúng khi `hasMin` đúng và $w\ge$ `MinPlateauDecades`.
+5. Nếu có vùng phẳng: $BI=\sigma_{\min}/0.6643$ (đọc ở đáy đã làm mượt), `tau_BI` là τ tại đáy.
+
+### 5.7 Nhận diện đỉnh (nhiễu tương quan)
+
+Nhiễu Gauss–Markov bậc 1 (ví dụ bộ lọc IIR $y[n]=\alpha\,y[n-1]+(1-\alpha)x[n]$ với hằng số thời gian $T_c=-\Delta t/\ln\alpha$) có ADEV tăng với độ dốc $+1/2$ ở τ ngắn, đạt **đỉnh** ở $\tau\approx1.89\,T_c$, rồi giảm với độ dốc $-1/2$.
+
+Hàm tìm điểm mà độ dốc đổi từ dương sang âm, yêu cầu đỉnh cao hơn cả hai phía một khoảng đủ lớn (khoảng 1.15 lần). Khi tìm thấy:
+
+$$T_c\approx\frac{\tau_{\text{peak}}}{1.89}$$
+
+### 5.8 Ước lượng hệ số ARW, RRW, RR
+
+Các hệ số được lấy từ trung vị trên những điểm có độ dốc gần giá trị lý thuyết:
+
+| Hệ số | Vùng chọn | Công thức |
+|---|---|---|
+| $N$ | $\|s+0.5\|<0.10$, chỉ xét **trước** điểm đầu tiên có $s>0.10$ | $\text{median}\left(\sigma\sqrt\tau\right)$ |
+| $K$ | $\|s-0.5\|<0.10$, sau cực tiểu (nếu có) | $\text{median}\left(\sigma\sqrt{3/\tau}\right)$ |
+| $R$ | $\|s-1\|<0.15$, sau cực tiểu (nếu có) | $\text{median}\left(\sqrt2\,\sigma/\tau\right)$ |
+
+Điều kiện "trước điểm đầu tiên có $s>0.10$" ngăn việc nhầm đoạn dốc $-1/2$ ở đuôi bộ lọc IIR thành ARW. Đây chỉ là ước lượng chỉ thị: nếu vùng dốc không đủ rộng hoặc lẫn các nhiễu khác, giá trị có thể lệch (trong test, $K$ lệch khoảng 40 phần trăm khi lẫn thành phần của bộ lọc IIR).
+
+Đổi đơn vị ARW: nếu dữ liệu tính bằng °/h thì $N$ có đơn vị °/h·√s, và $N\,[°/\sqrt{h}]=N\,[°/h\cdot\sqrt{s}]/60$.
+
+### 5.9 Quy tắc ra `verdict`
+
+Theo thứ tự ưu tiên:
+
+| Điều kiện | Kết luận |
+|---|---|
+| `hasPlateau` | **BI PRESENT**: có đáy phẳng, kèm bề rộng |
+| `hasMin` nhưng vùng phẳng hẹp | **BI POSSIBLE**: có cực tiểu nhưng vùng phẳng chưa đủ rộng (có thể bị RRW/RR che hoặc bản ghi quá ngắn) |
+| `hasPeak` | **NO classical BI minimum; correlated-noise bump**: chỉ có đỉnh nhiễu tương quan |
+| độ dốc trung bình ở một phần tư cuối nhỏ hơn $-0.3$ | **NO BI visible**: nhiễu trắng còn chiếm ưu thế ở τ dài nhất (cần bản ghi dài hơn) |
+| độ dốc trung bình ở một phần tư cuối lớn hơn $+0.3$ | **NO BI visible**: drift/random-walk chiếm ưu thế, không có cực tiểu |
+| còn lại | **NO clear BI**: không có cực tiểu bên trong |
+
+---
+
+## 6. Đồ thị
+
+- **Trên:** đường ADEV (log-log), dải tin cậy xanh nhạt, vùng phẳng (nét xanh lá đậm), điểm cực tiểu (ô vuông đỏ) và đỉnh (tam giác tím) nếu có. Tiêu đề là `verdict`.
+- **Dưới:** độ dốc cục bộ theo τ, hai đường đứt xanh lá là $\pm$`SlopeTol`, các đường chấm xám là các mốc $-1/2$, $+1/2$ và $+1$.
+
+Cách đọc nhanh: đường cong đi xuống (dốc $-1/2$) rồi có đoạn nằm ngang rồi đi lên là dấu hiệu BI cổ điển; chỉ có một ụ cao (dốc $+1/2$ rồi $-1/2$) là nhiễu tương quan.
+
+---
+
+## 7. Giới hạn và lưu ý
+
+1. **Chỉ có ý nghĩa với đầu vào tĩnh.** Nếu `data` chứa chuyển động thật (tốc độ quay thay đổi), ADEV phản ánh chuyển động chứ không phải nhiễu.
+2. **Độ dài bản ghi quyết định τ tối đa.** Muốn thấy BI ở τ vài trăm giây thì cần bản ghi dài hơn nhiều lần như vậy. Điểm cuối đường cong có độ tin cậy thấp.
+3. **BI bị che khi RRW hoặc Rate Ramp lớn.** Chúng kéo đuôi ADEV lên sớm. Detrend loại được ramp tất định nhưng không loại được RRW.
+4. **Đáy ADEV chỉ phản ánh "BI" đúng nghĩa 1/f.** Nhiễu flicker mô phỏng bằng IIR bậc 1 là Gauss–Markov, cho đỉnh thay vì đáy phẳng. Khi đó trường `BI` thường là NaN, hãy dùng `tau_peak` và `tauc_est`. Khi so sánh trước/sau thuật toán, giữ nguyên một định nghĩa BI.
+5. **Đáy lẫn các nhiễu khác.** $BI=\sigma_{\min}/0.6643$ chỉ chính xác khi tại đáy chỉ có nhiễu 1/f. Nếu còn ARW và RRW đáng kể, đáy cao hơn $0.6643B$ và BI bị ước lượng cao. Trong test mô hình có cả ba loại nhiễu, sai khác so với đáy lý thuyết của mô hình khoảng 2 phần trăm.
+6. **Dải tin cậy chỉ xấp xỉ.** Dùng để tham khảo trực quan, không dùng làm kết luận thống kê chặt.
+7. **Tham số ngưỡng mang tính kinh nghiệm.** `SlopeTol`, `MinPlateauDecades` và các ngưỡng nội bộ (1.1 lần, 1.15 lần, trọng số làm mượt 5 điểm) được chọn cho dữ liệu mô phỏng; với dữ liệu thật nên đối chiếu bằng mắt trên đồ thị.
+
+---
+
+## 8. Kiểm chứng đã thực hiện
+
+Hàm được kiểm thử trên 10 kịch bản có đáp án biết trước (nhiễu trắng, RRW, ramp, mô hình ARW + 1/f + RRW, nhiễu flicker IIR của hệ FOG, bộ nhiễu của `main.m`, drift với các kiểu detrend, tính nhất quán `rate`/`angle` và `Scale`, kiểm chéo công thức, xử lý lỗi đầu vào). Kết quả chính:
+
+| Kiểm tra | Kết quả |
+|---|---|
+| ADEV so với thư viện `allantools` (hàm `oadev`) trên hai bộ dữ liệu | Sai lệch tương đối lớn nhất cỡ $4\times10^{-12}$ |
+| Kiểm chéo bằng công thức trung bình cụm (thuần MATLAB) | Sai lệch cỡ $10^{-14}$ |
+| Nhiễu trắng, RRW, ramp | Hệ số ước lượng sai khác dưới 5 phần trăm (RRW dưới 15 phần trăm) so với giá trị thật |
+| ARW + 1/f + RRW | Kết luận "BI PRESENT", vùng phẳng rộng 2.13 decade, BI = 0.0102 so với đáy lý thuyết 0.0104 |
+| Flicker IIR ($\alpha=0.995$, $\Delta t=10^{-3}$) | Kết luận "bump", $T_c$ ước lượng 0.187 s so với giá trị thật 0.199 s |
+| Drift tuyến tính | `'mean'`: vùng phẳng co còn 0.58 decade và BI lệch cao; `'linear'`/`'poly2'`: khôi phục 2.13 decade |
+
+Các phép kiểm thử trên chạy bằng GNU Octave 8.4. Script `test_allan_matlab.m` là bản thuần MATLAB của cùng bộ test; bản này chưa được chạy trực tiếp trong MATLAB.
+
+---
+
+## 9. Tài liệu tham khảo
+
+- IEEE Std 952-1997, *IEEE Standard Specification Format Guide and Test Procedure for Single-Axis Interferometric Fiber Optic Gyros* (nguồn của các công thức ADEV theo họ nhiễu và hệ số 0.6643 cho BI).
+- D. W. Allan, "Statistics of Atomic Frequency Standards," *Proc. IEEE*, 1966.
